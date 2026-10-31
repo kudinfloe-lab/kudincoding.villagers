@@ -11,9 +11,12 @@ import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.monster.zombie.ZombieVillager;
 import net.minecraft.world.entity.npc.villager.Villager;
+import net.minecraft.world.item.trading.MerchantOffer;
+import net.minecraft.world.item.trading.MerchantOffers;
 import net.minecraft.world.phys.AABB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,14 +46,24 @@ public class KudincodingVillagers implements ModInitializer {
     private final Set<String> usedNames = new HashSet<>();
     private final Random random = new Random();
 
-    // Track villager professions and levels to detect job changes and promotions
+    // Track villager professions and levels to detect promotions and job changes
     private final Map<UUID, String> lastKnownProfession = new HashMap<>();
     private final Map<UUID, Integer> lastKnownLevel = new HashMap<>();
     private int tickCounter = 0;
 
-    // Active server instance to broadcast to chat
-    private static MinecraftServer currentServer = null;
+    // Shout timer (2400 ticks = 2 minutes) & radius (48 blocks)
+    private static final int SHOUT_INTERVAL_TICKS = 2400;
+    private static final double SHOUT_RADIUS = 48.0;
 
+    private static final String[] SHOUT_TEMPLATES = {
+            "\"Step right up! Today I'm parting with %s for just %d emerald(s)!\"",
+            "\"Fresh stock just arrived! Who needs %s? Only %d emerald(s)!\"",
+            "\"You won't find a better deal on %s in this whole province! Starting at %d emerald(s)!\"",
+            "\"Don't walk into the wild unprepared! Grab %s while supplies last! (%d emeralds)\"",
+            "\"Special discount today on %s! Going for %d emerald(s)!\""
+    };
+
+    private static MinecraftServer currentServer = null;
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     @Override
@@ -59,7 +72,7 @@ public class KudincodingVillagers implements ModInitializer {
         loadUsedNamesFromFile();
         logEvent(null, "=== Mod initialized ===");
 
-        // Capture server instance and reset session trackers when starting a world
+        // Store server instance and clean up memory on start/stop
         ServerLifecycleEvents.SERVER_STARTING.register(server -> {
             currentServer = server;
             loadUsedNamesFromFile();
@@ -68,12 +81,11 @@ public class KudincodingVillagers implements ModInitializer {
             logEvent(server, "--- World starting: Loaded " + usedNames.size() + " permanently used names ---");
         });
 
-        // Clear server reference when stopping
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             currentServer = null;
         });
 
-        // 1. EVENT: Villager loads or spawns into the world
+        // 1. EVENT: Villager loads or spawns
         ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
             if (entity instanceof Villager villager) {
                 String currentProf = getProfessionName(villager);
@@ -99,7 +111,7 @@ public class KudincodingVillagers implements ModInitializer {
             }
         });
 
-        // 2. EVENT: Villager dies
+        // 2. EVENT: Villager dies (Name is permanently retired)
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
             if (entity instanceof Villager villager) {
                 String name = getVillagerDisplayName(villager);
@@ -114,44 +126,49 @@ public class KudincodingVillagers implements ModInitializer {
             }
         });
 
-        // 3. EVENT: Check every 1 second (20 ticks) for Job changes and Promotions
+        // 3. EVENT: Server Tick for Job Changes, Promotions & Periodic Merchant Shouts
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             tickCounter++;
-            if (tickCounter % 20 != 0) return;
 
-            for (ServerLevel level : server.getAllLevels()) {
-                for (Villager villager : getAllLoadedVillagers(level)) {
-                    UUID id = villager.getUUID();
-                    String name = getVillagerDisplayName(villager);
-                    String currentProf = getProfessionName(villager);
-                    int currentLvl = villager.getVillagerData().level();
+            // Every 1 second (20 ticks): Check jobs & promotions
+            if (tickCounter % 20 == 0) {
+                for (ServerLevel level : server.getAllLevels()) {
+                    for (Villager villager : getAllLoadedVillagers(level)) {
+                        UUID id = villager.getUUID();
+                        String name = getVillagerDisplayName(villager);
+                        String currentProf = getProfessionName(villager);
+                        int currentLvl = villager.getVillagerData().level();
 
-                    String oldProf = lastKnownProfession.get(id);
-                    Integer oldLvl = lastKnownLevel.get(id);
+                        String oldProf = lastKnownProfession.get(id);
+                        Integer oldLvl = lastKnownLevel.get(id);
 
-                    // Check if profession changed
-                    if (oldProf != null && !oldProf.equals(currentProf)) {
-                        if (oldProf.equals("none")) {
-                            logEvent(server, "GOT JOB: Villager '" + name + "' became a " + currentProf + " at " + formatPos(villager));
-                        } else if (currentProf.equals("none")) {
-                            logEvent(server, "LOST JOB: Villager '" + name + "' lost their job as a " + oldProf + " at " + formatPos(villager));
-                        } else {
-                            logEvent(server, "CHANGED JOB: Villager '" + name + "' switched job from " + oldProf + " to " + currentProf + " at " + formatPos(villager));
+                        if (oldProf != null && !oldProf.equals(currentProf)) {
+                            if (oldProf.equals("none")) {
+                                logEvent(server, "GOT JOB: Villager '" + name + "' became a " + currentProf + " at " + formatPos(villager));
+                            } else if (currentProf.equals("none")) {
+                                logEvent(server, "LOST JOB: Villager '" + name + "' lost their job as a " + oldProf + " at " + formatPos(villager));
+                            } else {
+                                logEvent(server, "CHANGED JOB: Villager '" + name + "' switched job from " + oldProf + " to " + currentProf + " at " + formatPos(villager));
+                            }
                         }
-                    }
 
-                    // Check if trade level increased
-                    if (oldLvl != null && currentLvl > oldLvl) {
-                        logEvent(server, "PROMOTED: Villager '" + name + "' (" + currentProf + ") leveled up from Level " + oldLvl + " to Level " + currentLvl + "!");
-                    }
+                        if (oldLvl != null && currentLvl > oldLvl) {
+                            logEvent(server, "PROMOTED: Villager '" + name + "' (" + currentProf + ") leveled up from Level " + oldLvl + " to Level " + currentLvl + "!");
+                        }
 
-                    lastKnownProfession.put(id, currentProf);
-                    lastKnownLevel.put(id, currentLvl);
+                        lastKnownProfession.put(id, currentProf);
+                        lastKnownLevel.put(id, currentLvl);
+                    }
                 }
+            }
+
+            // Every 2 minutes: One random merchant shouts their trade to nearby players
+            if (tickCounter % SHOUT_INTERVAL_TICKS == 0) {
+                broadcastRandomMerchantShout(server);
             }
         });
 
-        // 4. EVENT: Detect Zombie Villager spawns (Zombification)
+        // 4. EVENT: Detect Zombie Villager spawns
         ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
             if (entity instanceof ZombieVillager zv && zv.hasCustomName() && zv.getCustomName() != null) {
                 String name = zv.getCustomName().getString();
@@ -164,13 +181,67 @@ public class KudincodingVillagers implements ModInitializer {
         registerCommands();
     }
 
-    // Writes to text file AND broadcasts to all players in chat
+    private void broadcastRandomMerchantShout(MinecraftServer server) {
+        List<Villager> workingVillagers = new ArrayList<>();
+
+        for (ServerLevel level : server.getAllLevels()) {
+            for (Villager villager : getAllLoadedVillagers(level)) {
+                if (!villager.isBaby() && !getProfessionName(villager).equals("none") && villager.hasCustomName()) {
+                    MerchantOffers offers = villager.getOffers();
+                    if (offers != null && !offers.isEmpty()) {
+                        workingVillagers.add(villager);
+                    }
+                }
+            }
+        }
+
+        if (workingVillagers.isEmpty()) return;
+
+        // Pick one random merchant
+        Villager merchant = workingVillagers.get(random.nextInt(workingVillagers.size()));
+        MerchantOffers offers = merchant.getOffers();
+        if (offers == null || offers.isEmpty()) return;
+
+        List<MerchantOffer> validOffers = offers.stream()
+                .filter(offer -> !offer.getResult().isEmpty())
+                .collect(Collectors.toList());
+
+        if (validOffers.isEmpty()) return;
+
+        MerchantOffer chosenOffer = validOffers.get(random.nextInt(validOffers.size()));
+        String itemName = chosenOffer.getResult().getHoverName().getString();
+        int price = chosenOffer.getCostA().getCount();
+        if (price <= 0) price = 1;
+
+        String template = SHOUT_TEMPLATES[random.nextInt(SHOUT_TEMPLATES.length)];
+        String quote = String.format(template, itemName, price);
+        String merchantName = getVillagerDisplayName(merchant);
+        String prof = getProfessionName(merchant);
+
+        Component shoutComponent = Component.literal("§6[Merchant] §e" + merchantName + " the " + prof + " §fshouts: " + quote);
+
+        // Send shout strictly to players within 48 blocks
+        if (merchant.level() instanceof ServerLevel merchantLevel) {
+            double radiusSq = SHOUT_RADIUS * SHOUT_RADIUS;
+            int heardCount = 0;
+
+            for (ServerPlayer player : merchantLevel.players()) {
+                if (player.distanceToSqr(merchant) <= radiusSq) {
+                    player.sendSystemMessage(shoutComponent);
+                    heardCount++;
+                }
+            }
+
+            logEvent(server, "MERCHANT SHOUT: '" + merchantName + "' promoted " + itemName + " for " + price + " emeralds (heard by " + heardCount + " player(s)).");
+        }
+    }
+
     private void logEvent(MinecraftServer server, String message) {
         Path logFile = FabricLoader.getInstance().getConfigDir().resolve("villager_logs.txt");
         String timestamp = LocalDateTime.now().format(TIME_FORMAT);
         String logLine = "[" + timestamp + "] " + message + System.lineSeparator();
 
-        // 1. Write to text file
+        // 1. Save to text file
         try {
             if (!Files.exists(logFile.getParent())) {
                 Files.createDirectories(logFile.getParent());
@@ -186,9 +257,9 @@ public class KudincodingVillagers implements ModInitializer {
             LOGGER.error("Failed to write to villager_logs.txt", e);
         }
 
-        // 2. Broadcast into in-game chat for all players
+        // 2. Announce in game chat (excluding shout logs to avoid duplicate messages)
         MinecraftServer activeServer = server != null ? server : currentServer;
-        if (activeServer != null) {
+        if (activeServer != null && !message.startsWith("MERCHANT SHOUT")) {
             activeServer.getPlayerList().broadcastSystemMessage(
                     Component.literal("§7[Villagers] §f" + message),
                     false
@@ -239,7 +310,7 @@ public class KudincodingVillagers implements ModInitializer {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("villagernames")
 
-                    // 1. /villagernames reload
+                    // /villagernames reload
                     .then(Commands.literal("reload").executes(context -> {
                         loadNamesFromFile();
                         logEvent(context.getSource().getServer(), "COMMAND: Reloaded villager_names.txt (" + villagerNames.size() + " total names).");
@@ -249,7 +320,13 @@ public class KudincodingVillagers implements ModInitializer {
                         return 1;
                     }))
 
-                    // 2. /villagernames nameunnamed
+                    // /villagernames shout
+                    .then(Commands.literal("shout").executes(context -> {
+                        broadcastRandomMerchantShout(context.getSource().getServer());
+                        return 1;
+                    }))
+
+                    // /villagernames nameunnamed
                     .then(Commands.literal("nameunnamed").executes(context -> {
                         int count = 0;
                         for (ServerLevel level : context.getSource().getServer().getAllLevels()) {
@@ -270,7 +347,7 @@ public class KudincodingVillagers implements ModInitializer {
                         return 1;
                     }))
 
-                    // 3. /villagernames renameall
+                    // /villagernames renameall
                     .then(Commands.literal("renameall").executes(context -> {
                         usedNames.clear();
                         saveUsedNamesToFile();
