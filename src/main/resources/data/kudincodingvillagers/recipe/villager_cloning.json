@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    "minecraft:player_head",
+    "minecraft:player_head"
+  ],
+  "result": {
+    "id": "minecraft:villager_spawn_egg",
+    "count": 1,
+    "components": {
+      "minecraft:entity_data": {
+        "id": "minecraft:villager",
+        "Age": -24000
+      }
+    }
+  }
+}
